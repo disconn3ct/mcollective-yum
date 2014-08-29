@@ -3,9 +3,11 @@
 # This is a little smarter than a shell script.
 #
 #
+
 require 'mcollective'
 include MCollective::RPC
 require 'pp'
+require 'logger'
 
 options = rpcoptions do |parser, options|
 	parser.define_head "RedHat/Centos System Updater"
@@ -23,7 +25,30 @@ options = rpcoptions do |parser, options|
 	parser.on('--check', '--checkonly', 'Only check for updates') do |v|
 		options[:checkonly] = v
 	end
+	parser.on('-l', '--logfile FILE', 'Log file to write (defaults to patch-YYMMDD-HHMM.log)') do |f|
+		options[:logfile] = f
+	end
 end
+
+if options.include?(:logfile)
+	logfile=options[:logfile]
+else
+	logfile=("patch-%s.log" % Time.new.strftime("%y%m%d-%H%M"))
+end
+
+log = Logger.new(logfile)
+outlog = Logger.new(STDOUT)
+
+if options.include?(:verbose)
+	log.level = Logger::DEBUG
+	outlog.level = Logger::DEBUG
+else
+	log.level = Logger::INFO
+	outlog.level = Logger::INFO
+end
+
+log.info("Logfile: "+logfile)
+outlog.info("Logfile: "+logfile)
 
 # FIXME: There is probably a better way to do this
 if options.include?(:bw)
@@ -73,7 +98,9 @@ else
 end
 
 if options.include?(:checkonly) and options.include?(:rhncheck)
-	abort("EE: Specify only one of check and rhncheck".bold.red)
+	outlog.fatal("Specify only one of check and rhncheck".bold.red)
+	log.fatal("Specify only one of check and rhncheck")
+	abort()
 end
 
 yumrpc = rpcclient("yum", :options => options)
@@ -92,7 +119,9 @@ yumrpc.progress = false
 # Make sure there is a filter
 if !options.include?(:allhosts)
 	if yumrpc.filter.empty? or yumrpc.filter == {"compound"=>[], "agent"=>["yum"], "fact"=>[], "cf_class"=>[], "identity"=>[]}
-		abort("EE: You must provide a host filter!".bold.red)
+		outlog.fatal("You must provide a host filter!".bold.red)
+		log.fatal("You must provide a host filter!")
+		abort()
 	end
 end
 
@@ -101,21 +130,28 @@ rebootlist=[]
 errorlist=[]
 
 # Status output
-puts("II: Finding matching hosts...")
+log.info("Finding matching hosts...")
+outlog.info("Finding matching hosts...")
 
 # Run a manual discovery so that we can keep the results
 hostlist=yumrpc.discover
 
 if hostlist.empty?
-	abort("EE: No hosts found!".bold.red)
+	log.fatal("No hosts found!")
+	outlog.fatal("No hosts found!".bold.red)
+	abort()
 elsif hostlist.count > 30
-	printf("WW:".brown+" Found more than 30 hosts (%s total). Continue? (y/n) ".bold, hostlist.count)
+	log.warn("Found more than 30 hosts (#{hostlist.count} total).")
+	outlog.warn("Found more than 30 hosts (#{hostlist.count} total). Continue? (y/n)".bold.brown)
 	input = gets.strip
 	if input != "y" and input != "Y"
-		abort("EE: Aborting at user request.".bold.red)
+		log.fatal("Aborting at user request.")
+		outlog.fatal("Aborting at user request.".bold.red)
+		abort()
 	end
 else
-	printf("II: Found %s host(s).\n",hostlist.count)
+	log.info("Found #{hostlist.count} host(s).")
+	outlog.info("Found #{hostlist.count} host(s).")
 end
 
 hostcount=0
@@ -125,60 +161,74 @@ if !options.include?(:rhncheck)
 	yumrpc.custom_request("check-update",{},hostlist,yumrpc.filter) do |resp|
 		# If yum exited with an error, remove the host from the list.
 		if resp[:body][:statuscode] != 0
-			printf("EE:".bold.red+" %s: ERROR: %s\n", resp[:senderid].bold,resp[:body][:statusmsg])
+			log.error("#{resp[:senderid]}: ERROR: #{resp[:body][:statusmsg]}")
+			outlog.error("#{resp[:senderid.bold.red]}: ERROR: #{resp[:body][:statusmsg]}")
 			errorlist.push(resp[:senderid])
 			hostlist.delete(resp[:senderid])
 		else
 			# If there are no packages to update, remove the host from the list
 			if resp[:body][:data][:outdated_packages].empty?
-				printf("OK:".bold.green+" %s: Up to date\n",resp[:senderid].bold)
+				log.info("#{resp[:senderid]}: Up to date")
+				outlog.info("#{resp[:senderid].bold.green}: Up to date")
 				hostlist.delete(resp[:senderid])
 			else
-				printf("II: %s: ", resp[:senderid].bold)
+				log.info("#{resp[:senderid]}: ")
+				outlog.info("#{resp[:senderid].bold}: ")
 				resp[:body][:data][:outdated_packages].each do |package|
 					if package[:package].include? "kernel"
 						if !rebootlist.include?(resp[:senderid])
 							rebootlist.push(resp[:senderid])
 						end
 					end
-					printf("%s, ", package[:package])
+					log.info("    #{package[:package]}")
+					outlog.info("    #{package[:package]}")
 				end
 				hostcount += 1
-				printf("\n")
 			end
 		end
 	end
 
 	# Notify user of hosts that may need a reboot
 	if !rebootlist.empty?
-		printf("WW:".bold.brown+" Reboot list:\n")
+		outlog.warn("Reboot list:")
+		log.warn("Reboot list:")
 		rebootlist.each do |reboot|
-			printf("WW:".bold.brown+"    %s\n",reboot)
+			log.warn("    #{reboot}")
+			outlog.warn("    #{reboot}")
 		end
 	end
 
 	# List systems that had errors on check-update
 	if !errorlist.empty?
-		printf("EE:".bold.red+" Errored Hosts:\n")
+		outlog.error("Errored Hosts:".bold.red)
+		log.error("Errored Hosts:")
 		errorlist.each do |error|
-			printf("EE:".bold.red+"    %s\n",error)
+			outlog.error("    #{error}".bold.red)
+			log.error("    #{error}".bold.red)
 		end
 	end
 
 	if hostcount == 0
-		abort("EE: No hosts need updates. Aborting.".bold.red)
+		outlog.fatal("No hosts need updates. Aborting.".bold.red)
+		log.fatal("No hosts need updates. Aborting.")
+		abort()
 	else
-		printf("II: %s host(s) need to be updated.\n",hostcount)
+		outlog.info("#{hostcount} host(s) need to be updated.")
+		log.info("#{hostcount} host(s) need to be updated.")
 	end
 
 	# Exit if check-update is all that was requested
 	if options.include?(:checkonly)
-		abort("II: Exiting.")
+		outlog.info("Check-update complete. Exiting.")
+		log.info("Check-update complete. Exiting.")
+		abort()
 	end
-	printf "II: Do you want to patch these systems? (y/n only): "
+	printf "Do you want to patch these systems? (y/n only): ".bold
 	input = gets.strip
 	if input != "y" and input != "Y"
-		abort("EE: Aborting at user request.".bold.red)
+		outlog.fatal("Aborting at user request.".bold.red)
+		log.fatal("Aborting at user request.")
+		abort()
 	end
 
 	errorpatch=[]
@@ -191,49 +241,50 @@ if !options.include?(:rhncheck)
 	yumrpc.custom_request("update",{},hostlist,yumrpc.filter) do |resp|
 		# Check for errors in status or yum exit code
 		if resp[:body][:statuscode] != 0 or resp[:body][:data][:exitcode] != 0
-			printf("EE:".bold.red+" %s: %s (exit %s), msg %s\n",
-			       resp[:senderid].bold,
-			       resp[:body][:statuscode],
-			       resp[:body][:data][:exitcode],
-			       resp[:body][:statusmsg])
+			outlog.error("#{resp[:senderid].bold.red}: #{resp[:body][:statuscode]} (exit #{resp[:body][:data][:exitcode]}), msg #{resp[:body][:statusmsg]}")
+			log.error("EE: #{resp[:senderid]}: #{resp[:body][:statuscode]} (exit #{resp[:body][:data][:exitcode]}), msg #{resp[:body][:statusmsg]}")
 			# This doesn't print much most of the time, but when it does it is error messages
 			resp[:body][:data][:output].each do |line|
-				printf("EE:  %s".bold.red, line)
+				outlog.error("    #{line}".bold.red, line)
+				log.error("    #{line}".bold.red, line)
 			end
-			puts "\n"
 			errorpatch.push(resp[:senderid])
 
 			# Delete from the hostlist so that rhn_check is not run
 			hostlist.delete(resp[:senderid])
 		else
-			printf("II: %s: %s (exit %s), msg %s\n",resp[:senderid].bold,
-			       resp[:body][:statuscode],
-			       resp[:body][:data][:exitcode],
-			       resp[:body][:statusmsg])
+			outlog.info("#{resp[:senderid].bold}: #{resp[:body][:statuscode]} (exit #{resp[:body][:data][:exitcode]}), msg #{resp[:body][:statusmsg]}")
+			log.info("#{resp[:senderid]}: #{resp[:body][:statuscode]} (exit #{resp[:body][:data][:exitcode]}), msg #{resp[:body][:statusmsg]}")
 			successpatch+=1
 		end
 	end
 
 	if !errorpatch.empty?
-		printf("EE:".bold.red+" Unpatched Hosts:\n")
+		outlog.error("Unpatched Hosts:".bold.red)
+		log.error("Unpatched Hosts:")
 		errorpatch.each do |error|
-			printf("EE:".bold.red+"    %s\n",error.bold)
+			outlog.error("    #{error.bold.red}")
+			log.error("    #{error}")
 		end
 	end
 
-	printf("II: %s host(s) patched successfully.\n", successpatch)
+	outlog.info("#{successpatch} host(s) patched successfully.")
+	log.info("#{successpatch} host(s) patched successfully.")
 
 	# from rhncheck-only
 else
 	# There is no host list output above so list them now
 	hostlist.each do |host|
-		printf("II: %s\n", host)
+		outlog.info("#{host}")
+		log.info("#{host}")
 	end
 end
-printf "II: Do you want to run rhn_check on these systems? (y/n only): "
+printf "Do you want to run rhn_check on these systems? (y/n only): "
 input = gets.strip
 if input != "y" and input != "Y"
-	abort("EE: Aborting at user request.".bold.red)
+	outlog.fatal("Aborting at user request.".bold.red)
+	log.fatal("Aborting at user request.")
+	abort()
 end
 
 errorrhn=[]
@@ -244,31 +295,31 @@ shellrpc.filter = yumrpc.filter
 shellrpc.custom_request("cmd",{:cmd => "/usr/sbin/rhn_check"},hostlist,shellrpc.filter) do |resp|
 	# Check for errors in status
 	if resp[:body][:statuscode] != 0
-		printf("EE:".bold.red+" %s: %s, msg %s\n",
-		       resp[:senderid].bold,
-		       resp[:body][:statuscode],
-		       resp[:body][:statusmsg])
+		outlog.error("#{resp[:senderid].bold.red}: #{resp[:body][:statuscode]}, msg #{resp[:body][:statusmsg]}")
+		log.error("#{resp[:senderid]}: #{resp[:body][:statuscode]}, msg #{resp[:body][:statusmsg]}")
 		# This doesn't print much most of the time, but when it does it is error messages
 		if !resp[:body][:data][:out].empty?
 			resp[:body][:data][:out].each do |line|
-				printf("EE:  %s".bold.red, line)
+				outlog.error("    #{line.bold.red}")
+				log.error("    #{line}")
 			end
-			puts "\n"
 		end
 		errorrhn.push(resp[:senderid])
 	else
-		printf("II: %s: %s, msg %s\n",resp[:senderid].bold,
-		       resp[:body][:statuscode],
-		       resp[:body][:statusmsg])
+		outlog.info("#{resp[:senderid].bold}: #{resp[:body][:statuscode]}, msg #{resp[:body][:statusmsg]}")
+		log.info("#{resp[:senderid]}: #{resp[:body][:statuscode]}, msg #{resp[:body][:statusmsg]}")
 		successrhn+=1
 	end
 end
 
 if !errorrhn.empty?
-	printf("EE:".bold.red+" RHN_Check Error Hosts:\n")
+	outlog.error("RHN_Check Errors:".bold.red)
+	log.error("RHN_Check Errors:")
 	errorrhn.each do |error|
-		printf("EE:".bold.red+"    %s\n",error.bold)
+		outlog.error("    #{error.bold.red}")
+		log.error("    #{error}")
 	end
 end
+outlog.info("#{successrhn} host(s) checked in successfully.")
+log.info("#{successrhn} host(s) checked in successfully.")
 
-printf("II: %s host(s) checked in successfully.\n", successrhn)
